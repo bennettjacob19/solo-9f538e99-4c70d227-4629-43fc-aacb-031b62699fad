@@ -21,7 +21,7 @@ import psycopg2
 import psycopg2.extras
 
 from .config import Settings
-from .decoder import parse_message
+from .decoder import parse_message, parse_origin_message
 from .source import SourceDB
 from .storage import PHASE_STREAMING, HistoryStore
 
@@ -38,6 +38,9 @@ class CaptureWorker:
         self._thread: threading.Thread | None = None
         self._current_xid: int | None = None
         self._current_changes: list[dict[str, Any]] = []
+        # 当前源事务的网页操作号；仅当该事务内出现 operation_origins 登记时非空。
+        # 每个 BEGIN 都重置，保证来源绝不串到相邻事务。
+        self._current_operation_id: str | None = None
 
     # ----------------------------------------------------------------- life
     def start(self) -> None:
@@ -210,7 +213,6 @@ class CaptureWorker:
     def _handle_message(self, msg: Any) -> None:
         if self._stop.is_set():
             raise psycopg2.OperationalError("shutting down")
-
         if msg.data_start == 0:  # Primary keepalive 消息无载荷
             # 不主动确认：只随已落盘事务推进，绝不确认尚未落盘的更改
             return
@@ -218,7 +220,25 @@ class CaptureWorker:
         data = msg.payload.decode("utf-8")
         parsed = parse_message(data, self._settings.table_name)
         if parsed is None:
-            # 无关消息（DDL/其他表/序列…）：不回送任何 feedback。
+            # 来源登记表消息：同样只属于当前事务，随 BEGIN/COMMIT 边界归集
+            origin = parse_origin_message(data, self._settings.origin_table)
+            if origin is not None:
+                # 防御：事务外的来源消息无法归属，丢弃并记录，绝不污染下一个事务
+                if self._current_xid is None:
+                    log.warning(
+                        "origin message outside transaction boundary ignored: %s",
+                        origin["operation_id"],
+                    )
+                else:
+                    if origin["xid"] not in (None, self._current_xid):
+                        log.warning(
+                            "origin xid %s mismatches current txn %s for %s",
+                            origin["xid"], self._current_xid,
+                            origin["operation_id"],
+                        )
+                    self._current_operation_id = origin["operation_id"]
+                self._store.update_last_message_lsn(str(msg.wal_end))
+            # 其余无关消息（DDL/其他表/序列…）：不回送任何 feedback。
             # 槽位只随"已落盘事务"通过 send_feedback 推进，
             # 保证任何尚未落盘的更改都不会向源库确认。
             return
@@ -227,9 +247,14 @@ class CaptureWorker:
         if kind == "BEGIN":
             self._current_xid = parsed["xid"]
             self._current_changes: list[dict[str, Any]] = []
+            self._current_operation_id = None
         elif kind == "CHANGE":
             self._current_changes.append(parsed)
         elif kind == "COMMIT":
+            # 测试钩子：在"源库已提交、SQLite 未落盘"的窗口停留，
+            # 确定性验证待捕获状态不会被显示为已审计。生产默认 0 不等待。
+            if self._settings.capture_delay_ms:
+                self._stop.wait(self._settings.capture_delay_ms / 1000.0)
             # test_decoding: COMMIT 行本身不带 LSN，消息 wal_end 即该事务
             # 提交记录结束位置，用作该提交点的 LSN。
             commit_lsn = msg.wal_end
@@ -246,13 +271,14 @@ class CaptureWorker:
             commit_ts = raw_commit_msg.split(marker, 1)[1].rstrip(")")
 
         lsn_text = f"{commit_lsn >> 32:X}/{commit_lsn & 0xFFFFFFFF:08X}"
+        operation_id = self._current_operation_id
         written = self._store.persist_transaction(
-            xid, lsn_text, commit_ts, changes
+            xid, lsn_text, commit_ts, changes, operation_id
         )
         if written:
             log.info(
-                "txn %s persisted at %s with %d change(s)",
-                xid, lsn_text, len(changes),
+                "txn %s persisted at %s with %d change(s), operation_id=%s",
+                xid, lsn_text, len(changes), operation_id or "<unregistered>",
             )
         else:
             log.info("txn %s replayed after restart, skipped (idempotent)", xid)
@@ -261,4 +287,5 @@ class CaptureWorker:
         # 推进该槽的 confirmed_flush_lsn。绝不在落盘前发送 feedback。
         msg.cursor.send_feedback(flush_lsn=commit_lsn)
         self._current_changes = []
+        self._current_operation_id = None
         self._current_xid = None

@@ -9,6 +9,7 @@
     table public.artifacts: INSERT: artifact_no[integer]:1004 service_name[text]:'svc' version[text]:'1.0' sha256[text]:'aa'
     table public.artifacts: UPDATE: artifact_no[integer]:1004 ...
     table public.artifacts: DELETE: artifact_no[integer]:1004
+    table public.operation_origins: INSERT: operation_id[text]:'op-...' xid[bigint]:12345 created_at[timestamp with time zone]:'...'
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import re
 from typing import Any
 
 COLUMNS = ("artifact_no", "service_name", "version", "sha256")
+ORIGIN_COLUMNS = ("operation_id", "xid", "created_at")
 _OPS = ("INSERT", "UPDATE", "DELETE")
 _TABLE_PREFIX_RE = re.compile(r"^table (\S+): (INSERT|UPDATE|DELETE): ")
 _COL_RE_TEMPLATE = r"{name}\[[^\]]+\]:(?:""null""|(?:'((?:[^']|'')*)'|-?\d+(?:\.\d+)?))"
@@ -26,7 +28,8 @@ def _unescape_sql_literal(value: str) -> str:
     return value.replace("''", "'")
 
 
-def _parse_columns(payload: str, table_name: str) -> dict[str, Any] | None:
+def _parse_table(payload: str, table_name: str, columns: tuple[str, ...]) -> dict[str, Any] | None:
+    """通用按列名前缀解析。仅匹配以 table_name 结尾的限定表名。"""
     if not payload.startswith("table "):
         return None
     head = _TABLE_PREFIX_RE.match(payload)
@@ -41,7 +44,7 @@ def _parse_columns(payload: str, table_name: str) -> dict[str, Any] | None:
 
     # 逐列定位，用下一个列名前缀做边界，保证值里的空格/冒号不会被误切
     starts: list[tuple[int, str]] = []
-    for name in COLUMNS:
+    for name in columns:
         marker = name + "["
         idx = body.find(marker)
         if idx >= 0:
@@ -59,11 +62,32 @@ def _parse_columns(payload: str, table_name: str) -> dict[str, Any] | None:
         elif raw.startswith("'") and raw.endswith("'"):
             result[name] = _unescape_sql_literal(raw[1:-1])
         else:
-            result[name] = int(raw) if name == "artifact_no" else raw
+            result[name] = int(raw) if name in ("artifact_no", "xid") else raw
 
-    if "artifact_no" not in result:
+    return result
+
+
+def _parse_columns(payload: str, table_name: str) -> dict[str, Any] | None:
+    result = _parse_table(payload, table_name, COLUMNS)
+    if result is None or "artifact_no" not in result:
         return None
     return result
+
+
+def parse_origin_message(data: str, origin_table: str) -> dict[str, Any] | None:
+    """解析来源登记表消息（仅 INSERT 有意义）：
+    {"kind": "ORIGIN", "operation_id": str, "xid": int}；无关返回 None。
+    """
+    if not data.startswith("table "):
+        return None
+    parsed = _parse_table(data, origin_table, ORIGIN_COLUMNS)
+    if parsed is None or "operation_id" not in parsed:
+        return None
+    return {
+        "kind": "ORIGIN",
+        "operation_id": parsed["operation_id"],
+        "xid": parsed.get("xid"),
+    }
 
 
 def parse_message(data: str, table_name: str) -> dict[str, Any] | None:

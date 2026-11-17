@@ -15,3 +15,16 @@ FROM (VALUES
     (1003, 'notify-hub',       '0.9.3', 'ffeeddccbbaa9988776655443322110099887766554433221100998877665544')
 ) AS v(artifact_no, service_name, version, sha256)
 WHERE NOT EXISTS (SELECT 1 FROM artifacts);
+
+-- 网页成组操作的事务来源登记：
+-- 网页先生成操作号（operation_id），apply_operations 在与目录修改
+-- *同一个源事务* 内写入本表，因此来源记录与该事务的目录修改同成败：
+--   * 事务提交 → 登记与目录修改一起可见；
+--   * 事务回滚 → 登记一并消失，不留下任何可查来源；
+--   * 普通 SQL 直接改目录 → 本表无记录（来源未登记，且不能据此断言写入者）。
+-- xid 为写入时的当前事务号，供逻辑流按事务关联，防止来源串到相邻事务。
+CREATE TABLE IF NOT EXISTS operation_origins (
+    operation_id TEXT PRIMARY KEY,
+    xid          BIGINT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);

@@ -19,6 +19,14 @@ class SourceError(Exception):
     pass
 
 
+class OperationIdConflict(SourceError):
+    """网页操作号已存在（同一操作号重复提交），整组回滚、不产生第二个事务。"""
+
+    def __init__(self, operation_id: str) -> None:
+        super().__init__(f"操作号已存在，拒绝重复提交: {operation_id}")
+        self.operation_id = operation_id
+
+
 class SourceDB:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -47,10 +55,32 @@ class SourceDB:
                 cur.execute(fh.read())
 
     # ------------------------------------------------------------- 业务写入
-    def apply_operations(self, operations: list[dict[str, Any]]) -> dict[str, Any]:
-        """成组修改源目录：全部操作在同一个源事务里，要么全成功要么全回滚。"""
+    def apply_operations(
+        self,
+        operations: list[dict[str, Any]],
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """成组修改源目录：全部操作在同一个源事务里，要么全成功要么全回滚。
+
+        若给定网页操作号 operation_id，则在**同一事务**内把
+        (operation_id, 当前事务 xid) 写入来源登记表：来源与目录修改同成败，
+        回滚时登记一并消失。主键冲突（同一操作号重复提交）直接报错，整组回滚。
+        """
         inserted = updated = deleted = 0
         with self.connect() as conn, conn.cursor() as cur:
+            if operation_id is not None:
+                # txid_current()（PG 14/15/16 均内置）返回当前事务号；
+                # 与随后的目录修改严格同事务，提交前对其他会话不可见。
+                try:
+                    cur.execute(
+                        f"INSERT INTO {self._settings.origin_table}"
+                        "(operation_id, xid) VALUES (%s, txid_current())",
+                        (operation_id,),
+                    )
+                except psycopg2.errors.UniqueViolation:
+                    # 操作号主键冲突：连接上下文管理器会回滚整个事务，
+                    # 不产生任何目录修改，也不留第二条来源。
+                    raise OperationIdConflict(operation_id)
             for op in operations:
                 kind = op["op"]
                 if kind == "insert":
@@ -102,6 +132,28 @@ class SourceDB:
                 " FROM artifacts ORDER BY artifact_no"
             )
             return [dict(zip(FIXED_COLUMNS, row)) for row in cur.fetchall()]
+
+    def get_origin(self, operation_id: str) -> dict[str, Any] | None:
+        """在源库查网页操作号的来源登记。
+
+        只有已提交事务的登记对本查询可见：未提交/已回滚的事务其登记
+        不可见或已随回滚消失，天然满足"回滚不留下可查来源"。
+        返回 {"operation_id", "xid", "created_at"} 或 None。
+        """
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT operation_id, xid, created_at"
+                f" FROM {self._settings.origin_table} WHERE operation_id=%s",
+                (operation_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "operation_id": row[0],
+                "xid": int(row[1]),
+                "created_at": row[2].isoformat() if row[2] else None,
+            }
 
     # ------------------------------------------------------------- 复制槽
     def slot_exists(self, slot_name: str) -> bool:

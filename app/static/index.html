@@ -38,6 +38,10 @@
   .tag.DELETE { color:var(--err); border-color:var(--err); }
   .tag.INSERT, .tag.BASELINE { color:var(--ok); border-color:var(--ok); }
   .tag.UPDATE { color:#0969da; border-color:#0969da; }
+  .tag.origin { color:#8250df; border-color:#8250df; background:#fbefff; }
+  .tag.none { color:#656d76; }
+  .badge.CAPTURED { background:#dafbe1; color:var(--ok); }
+  .badge.PENDING_CAPTURE { background:#fff8c5; color:var(--warn); }
 </style>
 </head>
 <body>
@@ -53,6 +57,13 @@
 
   <section class="card">
     <h2>② 成组修改源目录（同一源事务提交）</h2>
+    <div style="margin-bottom:8px;">
+      <div class="muted">网页操作号（网页先生成，随整组修改同事务登记；留空则自动生成）</div>
+      <div style="display:flex; gap:8px; margin-top:4px;">
+        <input id="op-id" placeholder="操作号 operation_id，建议 UUID" style="font-family:monospace;">
+        <button onclick="genOpId()" type="button">生成 UUID</button>
+      </div>
+    </div>
     <div id="ops"></div>
     <div style="display:flex; gap:8px;">
       <button onclick="addOp('insert')">+ 新增</button>
@@ -60,21 +71,32 @@
       <button onclick="addOp('delete')">+ 删除</button>
       <button class="primary" onclick="submitOps()">整组提交</button>
     </div>
-    <div class="muted" style="margin-top:6px;">sha256 需 64 位十六进制；任一操作失败整组回滚。</div>
+    <div class="muted" style="margin-top:6px;">sha256 需 64 位十六进制；任一操作失败整组回滚，来源登记同时回滚。响应丢失时可凭操作号在下方查询最终状态。</div>
     <div class="msg" id="ops-msg"></div>
   </section>
 
+  <section class="card">
+    <h2>③ 按操作号查询捕获状态</h2>
+    <div style="display:flex; gap:8px;">
+      <input id="q-op-id" placeholder="输入操作号查询" style="font-family:monospace;">
+      <button onclick="queryOperation()">查询</button>
+    </div>
+    <div id="op-status" class="muted" style="margin-top:8px;">
+      待捕获不会显示为已审计；查不到可能是未提交或事务已回滚（回滚不留来源）。
+    </div>
+  </section>
+
   <section class="card full">
-    <h2>③ 选择提交点查看旧值（点击一行 = 查看该点整目录）</h2>
+    <h2>④ 选择提交点查看旧值（点击一行 = 查看该点整目录）</h2>
     <table>
-      <thead><tr><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th></tr></thead>
-      <tbody id="points"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      <thead><tr><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th><th>网页来源（操作号 / 来源未登记）</th></tr></thead>
+      <tbody id="points"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
     </table>
     <div id="dir-wrap" style="margin-top:14px;"></div>
   </section>
 
   <section class="card full">
-    <h2>④ 单编号完整历史（含删除/重用）</h2>
+    <h2>⑤ 单编号完整历史（含删除/重用）</h2>
     <div style="display:flex; gap:8px; max-width:420px;">
       <input id="hist-no" type="number" min="1" placeholder="制品编号，如 1001">
       <button onclick="loadHistory()">查询</button>
@@ -114,6 +136,10 @@ async function refreshProgress(){
 }
 
 // ------------------------------------------------------------- 成组修改
+function genOpId(){
+  if (crypto.randomUUID) document.getElementById('op-id').value = crypto.randomUUID();
+  else document.getElementById('op-id').value = 'op-' + Array.from(crypto.getRandomValues(new Uint8Array(16)), b=>b.toString(16).padStart(2,'0')).join('');
+}
 function opRow(type){
   const no = `<input class="f-no" type="number" min="1" placeholder="编号">`;
   const svc = `<input class="f-svc" placeholder="服务名">`;
@@ -151,15 +177,52 @@ async function submitOps(){
     operations.push({op, artifact_no:no, service_name, version, sha256});
   }
   if (!operations.length) return setMsg('ops-msg','请至少添加一行操作','err');
+  const operation_id = document.getElementById('op-id').value.trim() || undefined;
   try {
     const r = await getJSON('/api/source/operations', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({operations})
+      body: JSON.stringify({operations, operation_id})
     });
-    setMsg('ops-msg', `提交成功：新增 ${r.inserted} / 修改 ${r.updated} / 删除 ${r.deleted}`, 'ok');
+    setMsg('ops-msg', `提交成功：新增 ${r.inserted} / 修改 ${r.updated} / 删除 ${r.deleted}\n操作号：${r.operation_id}\n（若响应丢失，可用该操作号在右侧查询最终状态）`, 'ok');
+    document.getElementById('q-op-id').value = r.operation_id;
     document.getElementById('ops').innerHTML='';
+    document.getElementById('op-id').value='';
     refreshPoints();
   } catch(e){ setMsg('ops-msg', '提交失败（整组已回滚）：'+e.message, 'err'); }
+}
+
+// ------------------------------------------------------ 操作号状态查询
+async function queryOperation(){
+  const id = document.getElementById('q-op-id').value.trim();
+  const wrap = document.getElementById('op-status');
+  if (!id) { wrap.className='muted'; wrap.textContent='请输入操作号'; return; }
+  try {
+    const r = await getJSON('/api/operations/'+encodeURIComponent(id));
+    if (r.status === 'CAPTURED') {
+      wrap.className = '';
+      wrap.innerHTML = `<span class="badge CAPTURED">已捕获（已审计）</span>
+        <div style="margin-top:6px;" class="kv">
+          <div>操作号</div><div><code>${esc(r.operation_id)}</code></div>
+          <div>源事务 xid</div><div>${r.xid}</div>
+          <div>提交点 LSN</div><div><code>${esc(r.commit_lsn)}</code></div>
+          <div>提交时间</div><div>${esc(r.commit_ts ?? '—')}</div>
+          <div>变更行数</div><div>${r.change_count}</div>
+        </div>`;
+    } else {
+      wrap.className = '';
+      wrap.innerHTML = `<span class="badge PENDING_CAPTURE">待捕获（未审计）</span>
+        <div style="margin-top:6px;" class="kv">
+          <div>操作号</div><div><code>${esc(r.operation_id)}</code></div>
+          <div>源事务 xid</div><div>${esc(r.source_xid)}</div>
+          <div>源库登记时间</div><div>${esc(r.source_created_at ?? '—')}</div>
+          <div>捕获阶段</div><div>${esc(r.capture_state)}</div>
+        </div>
+        <div class="muted" style="margin-top:6px;">源库已提交，尚未进入 SQLite 历史库；刷新可查看最新状态。</div>`;
+    }
+  } catch(e){
+    wrap.className = 'msg err';
+    wrap.textContent = '查询失败：' + e.message;
+  }
 }
 
 // ---------------------------------------------------------------- 提交点
@@ -168,7 +231,7 @@ async function refreshPoints(){
   try {
     const r = await getJSON('/api/points');
     pointsCache = r.points;
-    if (!r.points.length) { tb.innerHTML='<tr><td colspan="5" class="muted">暂无提交点</td></tr>'; return; }
+    if (!r.points.length) { tb.innerHTML='<tr><td colspan="6" class="muted">暂无提交点</td></tr>'; return; }
     tb.innerHTML = r.points.map(p => `
       <tr class="point-row" onclick="viewDirectory('${esc(p.lsn)}')">
         <td><span class="tag ${p.kind}">${esc(p.kind)}</span></td>
@@ -176,9 +239,13 @@ async function refreshPoints(){
         <td>${p.xid ?? '—'}</td>
         <td>${esc(p.commit_ts ?? '—')}</td>
         <td>${p.change_count}</td>
+        <td>${p.kind === 'BASELINE' ? '<span class="muted">—</span>'
+            : (p.origin_registered
+                ? `<span class="tag origin" title="网页成组操作">网页操作号 <code>${esc(p.operation_id)}</code></span>`
+                : '<span class="tag none" title="普通 SQL 直改或升级前旧事务；不能据此断言写入者">来源未登记</span>')}</td>
       </tr>`).join('');
   } catch(e){
-    tb.innerHTML = `<tr><td colspan="5" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="6" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
   }
 }
 
@@ -203,12 +270,16 @@ async function loadHistory(){
     const r = await getJSON('/api/history/'+no);
     if (!r.history.length) { wrap.innerHTML='<div class="muted">该编号没有任何历史记录</div>'; return; }
     wrap.innerHTML = `<table><thead><tr><th>顺序</th><th>变更</th><th>服务名</th><th>版本</th><th>SHA-256</th>
-      <th>xid</th><th>提交点 LSN</th><th>捕获时间</th></tr></thead><tbody>
+      <th>xid</th><th>提交点 LSN</th><th>网页来源</th><th>捕获时间</th></tr></thead><tbody>
       ${r.history.map((h,i)=>`<tr><td>${i+1}</td><td><span class="tag ${esc(h.change_type)}">${esc(h.change_type)}</span></td>
         <td>${esc(h.service_name ?? '—')}</td><td>${esc(h.version ?? '—')}</td>
         <td><code>${esc(h.sha256 ?? '—')}</code></td><td>${h.xid ?? '—'}</td>
-        <td><code>${esc(h.commit_lsn ?? '—')}</code></td><td class="muted">${esc(h.captured_at)}</td></tr>`).join('')}
-      </tbody></table>`;
+        <td><code>${esc(h.commit_lsn ?? '—')}</code></td>
+        <td>${h.operation_id ? '<span class="tag origin">'+esc(h.operation_id)+'</span>'
+            : (h.xid ? '<span class="tag none">来源未登记</span>' : '—')}</td>
+        <td class="muted">${esc(h.captured_at)}</td></tr>`).join('')}
+      </tbody></table>
+      <div class="muted" style="margin-top:6px;">“来源未登记”仅表示该源事务没有网页操作号（普通 SQL 直改或升级前旧事务），不能据此断言具体写入者。</div>`;
   } catch(e){ wrap.innerHTML='<div class="msg err">'+esc(e.message)+'</div>'; }
 }
 

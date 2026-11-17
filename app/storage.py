@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS txns (
     xid            INTEGER PRIMARY KEY,
     commit_lsn     TEXT NOT NULL,
     commit_lsn_num INTEGER NOT NULL,
-    commit_ts      TEXT
+    commit_ts      TEXT,
+    operation_id   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS artifact_history (
@@ -74,10 +75,32 @@ class HistoryStore:
         self._conn.execute("PRAGMA synchronous=FULL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.executescript(SCHEMA_SQL)
+        self._migrate()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _migrate(self) -> None:
+        """旧版历史库（txns 无 operation_id 列）就地升级。
+
+        旧事务的 operation_id 一律为 NULL，网页显示"来源未登记"；
+        不能据此断言其写入者（可能是普通 SQL，也可能是升级前的网页操作）。
+        """
+        with self._lock:
+            cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(txns)").fetchall()
+            }
+            if "operation_id" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE txns ADD COLUMN operation_id TEXT"
+                )
+            # 新库建表即含该列、旧库刚补齐列，统一在此建索引（IF NOT EXISTS 幂等）
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_txns_operation"
+                " ON txns(operation_id)"
+            )
 
     # ------------------------------------------------------------------ state
     def _get_state(self, key: str) -> str | None:
@@ -187,8 +210,15 @@ class HistoryStore:
         commit_lsn: str,
         commit_ts: str | None,
         changes: list[dict[str, Any]],
+        operation_id: str | None = None,
     ) -> bool:
-        """落盘一个已提交源事务。返回 True=新写入，False=重复事务（已跳过）。"""
+        """落盘一个已提交源事务。返回 True=新写入，False=重复事务（已跳过）。
+
+        来源操作号与该事务的全部目录变更在**同一个 SQLite 事务**写入：
+        要么一起可见，要么一起不可见，不存在来源缺失/半条事务。
+        operation_id 为 None 表示该源事务没有网页来源登记
+        （普通 SQL 直改、回滚后重放的空事务、或升级前的旧事务）。
+        """
         lsn_num = lsn_to_num(commit_lsn)
         now = utc_now_iso()
         with self._lock:
@@ -200,9 +230,9 @@ class HistoryStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
-                    "INSERT INTO txns(xid, commit_lsn, commit_lsn_num, commit_ts)"
-                    " VALUES (?, ?, ?, ?)",
-                    (xid, commit_lsn, lsn_num, commit_ts),
+                    "INSERT INTO txns(xid, commit_lsn, commit_lsn_num, commit_ts,"
+                    " operation_id) VALUES (?, ?, ?, ?, ?)",
+                    (xid, commit_lsn, lsn_num, commit_ts, operation_id),
                 )
                 self._conn.executemany(
                     """
@@ -263,6 +293,7 @@ class HistoryStore:
             for row in self._conn.execute(
                 """
                 SELECT t.xid, t.commit_lsn, t.commit_lsn_num, t.commit_ts,
+                       t.operation_id,
                        (SELECT COUNT(*) FROM artifact_history h
                          WHERE h.xid = t.xid) AS change_count
                 FROM txns t ORDER BY t.commit_lsn_num, t.xid
@@ -276,9 +307,36 @@ class HistoryStore:
                         "xid": row["xid"],
                         "commit_ts": row["commit_ts"],
                         "change_count": row["change_count"],
+                        "operation_id": row["operation_id"],
+                        "origin_registered": row["operation_id"] is not None,
                     }
                 )
             return points
+
+    def get_operation(self, operation_id: str) -> dict[str, Any] | None:
+        """按网页操作号查已捕获事务；未捕获返回 None（由调用方再查源库）。"""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT xid, commit_lsn, commit_lsn_num, commit_ts, operation_id
+                FROM txns WHERE operation_id=?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            change_count = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM artifact_history WHERE xid=?",
+                (row["xid"],),
+            ).fetchone()["c"]
+            return {
+                "operation_id": row["operation_id"],
+                "xid": row["xid"],
+                "commit_lsn": row["commit_lsn"],
+                "commit_lsn_num": row["commit_lsn_num"],
+                "commit_ts": row["commit_ts"],
+                "change_count": change_count,
+            }
 
     def get_directory_at(self, lsn_num: int) -> list[dict[str, Any]]:
         """查看某个提交点（含）为止的整目录：每个编号取最后一条变更。"""
@@ -303,10 +361,13 @@ class HistoryStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT artifact_no, change_type, service_name, version, sha256,
-                       xid, commit_lsn, commit_lsn_num, captured_at
-                FROM artifact_history WHERE artifact_no=?
-                ORDER BY id
+                SELECT h.artifact_no, h.change_type, h.service_name, h.version,
+                       h.sha256, h.xid, h.commit_lsn, h.commit_lsn_num,
+                       h.captured_at, t.operation_id
+                FROM artifact_history h
+                LEFT JOIN txns t ON t.xid = h.xid
+                WHERE h.artifact_no=?
+                ORDER BY h.id
                 """,
                 (artifact_no,),
             ).fetchall()

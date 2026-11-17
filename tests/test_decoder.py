@@ -1,7 +1,7 @@
 """test_decoding 解析器单元测试：python3 -m unittest tests.test_decoder -v"""
 import unittest
 
-from app.decoder import parse_message
+from app.decoder import parse_message, parse_origin_message
 
 INSERT = (
     "table public.artifacts: INSERT: artifact_no[integer]:1004 "
@@ -58,6 +58,47 @@ class DecoderTest(unittest.TestCase):
                                         "artifacts"))
         self.assertIsNone(parse_message("DDL: something", "artifacts"))
         self.assertIsNone(parse_message("sequence public.foo: ...", "artifacts"))
+
+
+ORIGIN_INSERT = (
+    "table public.operation_origins: INSERT: operation_id[text]:'op-abcd1234'"
+    " xid[bigint]:736"
+    " created_at[timestamp with time zone]:'2026-11-17 06:00:00+00'"
+)
+ORIGIN_QUOTED = (
+    "table public.operation_origins: INSERT: operation_id[text]:'it''s-op'"
+    " xid[bigint]:8"
+)
+
+
+class OriginDecoderTest(unittest.TestCase):
+    def test_origin_insert(self):
+        m = parse_origin_message(ORIGIN_INSERT, "operation_origins")
+        self.assertEqual(m["kind"], "ORIGIN")
+        self.assertEqual(m["operation_id"], "op-abcd1234")
+        self.assertEqual(m["xid"], 736)
+
+    def test_origin_quoted_id(self):
+        m = parse_origin_message(ORIGIN_QUOTED, "operation_origins")
+        self.assertEqual(m["operation_id"], "it's-op")
+        self.assertEqual(m["xid"], 8)
+
+    def test_origin_other_table_ignored(self):
+        self.assertIsNone(
+            parse_origin_message("table public.artifacts: INSERT: x[integer]:1",
+                                 "operation_origins")
+        )
+        self.assertIsNone(parse_origin_message("DDL: x", "operation_origins"))
+
+    def test_origin_not_confused_with_artifact_stream(self):
+        # 主表解析器不认识来源表消息，反之亦然：两条流互不串扰
+        self.assertIsNone(parse_message(ORIGIN_INSERT, "artifacts"))
+        self.assertIsNone(
+            parse_origin_message(
+                "table public.artifacts: DELETE: artifact_no[integer]:1",
+                "operation_origins",
+            )
+        )
 
 
 if __name__ == "__main__":

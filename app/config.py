@@ -19,6 +19,7 @@ class Settings:
     )
     slot_name: str = _env("REPLICATION_SLOT", "artifacts_history_slot")
     table_name: str = _env("SOURCE_TABLE", "artifacts")
+    origin_table: str = _env("SOURCE_ORIGIN_TABLE", "operation_origins")
     init_sleep_ms: int = int(_env("CAPTURE_INIT_SLEEP_MS", "0"))
 
     # ---- 测试钩子（生产保持默认关闭）----
@@ -26,6 +27,15 @@ class Settings:
     # 直到基线落盘后才提交：确定性地构造"基线前开始、基线后提交"的事务。
     inflight_hook_no: int = int(_env("TEST_INFLIGHT_ARTIFACT_NO", "0"))
     inflight_hook_sleep_s: float = float(_env("TEST_INFLIGHT_SLEEP_S", "3"))
+    # 成组写入在源事务提交成功后、HTTP 响应返回前退出进程，
+    # 确定性模拟"源库已提交但网页响应丢失"。
+    exit_after_commit: bool = _env("TEST_EXIT_AFTER_COMMIT", "0") in ("1", "true", "TRUE")
+    # 成组写入在源事务提交成功后、HTTP 响应返回前暂停 N 秒，
+    # 用于构造"已提交但响应未返回"的窗口（此时查询应显示待捕获/已捕获而非已审计）。
+    delay_after_commit_s: float = float(_env("TEST_DELAY_AFTER_COMMIT_S", "0"))
+    # 捕获线程每条逻辑消息处理前等待的毫秒数，用于把"已提交未捕获"窗口
+    # 拉长到可确定观测的时长（生产保持 0 关闭）。
+    capture_delay_ms: int = int(_env("TEST_CAPTURE_DELAY_MS", "0"))
 
     # ---- 本地历史库 SQLite ----
     sqlite_path: str = _env("SQLITE_PATH", "/tmp/capture/history.db")
